@@ -6,6 +6,7 @@
 #include <unordered_set>
 #include <Pdh.h>
 #include <vector>
+#include <unordered_map>
 
 // Dear ImGui headers (Assuming you downloaded them into your project)
 #include "./imgui-resources/imgui.h"
@@ -256,54 +257,72 @@ struct DiskIoTracker {
 // ====================================================================
 //             Helper functions for GPU tracker
 // ====================================================================
-#include <vector> // Add this near your other includes
-
 struct GpuUsageTracker {
     PDH_HQUERY hQuery = nullptr;
-    PDH_HCOUNTER hCounter = nullptr;
-    DWORD lastPid = 0;
+    std::unordered_map<DWORD, PDH_HCOUNTER> pidCounters;
 
     ~GpuUsageTracker() {
         if (hQuery) PdhCloseQuery(hQuery);
     }
 
-    double GetUsage(DWORD currentPid) {
-        if (currentPid == 0) return 0.0;
+    double GetUsage(const std::unordered_set<DWORD>& treePids) {
+        if (treePids.empty()) return 0.0;
 
-        // If the user clicked a new window, we must completely rebuild the PDH query for the new PID
-        if (currentPid != lastPid || !hQuery) {
-            if (hQuery) PdhCloseQuery(hQuery);
-            PdhOpenQuery(nullptr, 0, &hQuery);
-            
-            // Query all GPU engines attached to this specific PID
-            char counterPath[256];
-            sprintf_s(counterPath, "\\GPU Engine(pid_%lu_*)\\Utilization Percentage", currentPid);
-            
-            PdhAddEnglishCounterA(hQuery, counterPath, 0, &hCounter);
-            PdhCollectQueryData(hQuery); // First call establishes the baseline
-            
-            lastPid = currentPid;
-            return 0.0; // Needs 1 tick to calculate a delta, just like CPU
+        if (!hQuery) PdhOpenQuery(nullptr, 0, &hQuery);
+
+        bool queryChanged = false;
+
+        // 1. Remove counters for child processes that have closed
+        for (auto it = pidCounters.begin(); it != pidCounters.end(); ) {
+            if (treePids.count(it->first) == 0) {
+                PdhRemoveCounter(it->second);
+                it = pidCounters.erase(it);
+                queryChanged = true;
+            } else {
+                ++it;
+            }
         }
 
-        // Collect the data delta since the last tick
+        // 2. Add new counters for spawned child processes
+        for (DWORD pid : treePids) {
+            if (pidCounters.count(pid) == 0) {
+                PDH_HCOUNTER hCounter;
+                char counterPath[256];
+                // The * wildcard here fetches all engines (3D, Copy, Video) for this specific PID
+                sprintf_s(counterPath, "\\GPU Engine(pid_%lu_*)\\Utilization Percentage", pid);
+                if (PdhAddEnglishCounterA(hQuery, counterPath, 0, &hCounter) == ERROR_SUCCESS) {
+                    pidCounters[pid] = hCounter;
+                    queryChanged = true;
+                }
+            }
+        }
+
+        if (pidCounters.empty()) return 0.0;
+
+        // 3. If the tree changed, we must collect once to establish a baseline and skip this frame
+        if (queryChanged) {
+            PdhCollectQueryData(hQuery);
+            return 0.0; 
+        }
+
         PdhCollectQueryData(hQuery);
 
-        // Determine how much memory we need to hold the results of the wildcard query
-        DWORD bufferSize = 0;
-        DWORD itemCount = 0;
-        PdhGetFormattedCounterArrayA(hCounter, PDH_FMT_DOUBLE, &bufferSize, &itemCount, nullptr);
-
-        if (bufferSize == 0 || itemCount == 0) return 0.0;
-
-        // Allocate memory and fetch the actual array of engine percentages
-        std::vector<char> buffer(bufferSize);
-        auto* items = reinterpret_cast<PDH_FMT_COUNTERVALUE_ITEM_A*>(buffer.data());
-        
+        // 4. Sum the GPU utilization across the entire process tree
         double totalGpu = 0.0;
-        if (PdhGetFormattedCounterArrayA(hCounter, PDH_FMT_DOUBLE, &bufferSize, &itemCount, items) == ERROR_SUCCESS) {
-            for (DWORD i = 0; i < itemCount; i++) {
-                totalGpu += items[i].FmtValue.doubleValue;
+        for (auto const& pair : pidCounters) {
+            PDH_HCOUNTER hCounter = pair.second;
+            DWORD bufferSize = 0;
+            DWORD itemCount = 0;
+            PdhGetFormattedCounterArrayA(hCounter, PDH_FMT_DOUBLE, &bufferSize, &itemCount, nullptr);
+
+            if (bufferSize > 0 && itemCount > 0) {
+                std::vector<char> buffer(bufferSize);
+                auto* items = reinterpret_cast<PDH_FMT_COUNTERVALUE_ITEM_A*>(buffer.data());
+                if (PdhGetFormattedCounterArrayA(hCounter, PDH_FMT_DOUBLE, &bufferSize, &itemCount, items) == ERROR_SUCCESS) {
+                    for (DWORD i = 0; i < itemCount; i++) {
+                        totalGpu += items[i].FmtValue.doubleValue;
+                    }
+                }
             }
         }
 
@@ -438,7 +457,7 @@ SetLayeredWindowAttributes(hwnd, RGB(0, 0, 0), 255, LWA_ALPHA);
             diskTracker.Update(cachedPid, treePids, currentTime);
 
             //5. Fetch GPU Usage
-            cachedGpuUsage = gpuTracker.GetUsage(cachedPid);
+            cachedGpuUsage = gpuTracker.GetUsage(treePids);
             
             lastUpdateTime = currentTime;
         }
