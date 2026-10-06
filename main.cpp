@@ -77,6 +77,116 @@ CloseHandle(hSnapshot);
     return totalRamBytes / (1024 * 1024); // Convert to MB
 }
 
+// 1. New Shared Helper: Gathers all PIDs in the tree
+std::unordered_set<DWORD> GetProcessTreePids(DWORD rootPid) {
+    std::unordered_set<DWORD> treePids;
+    if (rootPid == 0) return treePids;
+    
+    treePids.insert(rootPid);
+    HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (hSnapshot == INVALID_HANDLE_VALUE) return treePids;
+
+    PROCESSENTRY32 pe32;
+    pe32.dwSize = sizeof(PROCESSENTRY32);
+
+    bool addedNew = true;
+    while (addedNew) {
+        addedNew = false;
+        if (Process32First(hSnapshot, &pe32)) {
+            do {
+                if (treePids.count(pe32.th32ParentProcessID) > 0 && treePids.count(pe32.th32ProcessID) == 0) {
+                    treePids.insert(pe32.th32ProcessID);
+                    addedNew = true;
+                }
+            } while (Process32Next(hSnapshot, &pe32));
+        }
+    }
+    CloseHandle(hSnapshot);
+    return treePids;
+}
+
+// 2. Updated RAM Calculator: Now accepts the shared tree
+size_t GetProcessTreeRAM(const std::unordered_set<DWORD>& treePids) {
+    size_t totalRamBytes = 0;
+    for (DWORD pid : treePids) {
+        HANDLE hProc = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pid);
+        if (hProc) {
+            PROCESS_MEMORY_COUNTERS pmc;
+            if (GetProcessMemoryInfo(hProc, &pmc, sizeof(pmc))) {
+                totalRamBytes += pmc.WorkingSetSize;
+            }
+            CloseHandle(hProc);
+        }
+    }
+    return totalRamBytes / (1024 * 1024);
+}
+
+// 3. Updated CPU Tracker: Sums execution time across the entire tree
+struct CpuUsageTracker {
+    DWORD lastRootPid = 0;
+    ULARGE_INTEGER lastSystemTime = { 0 };
+    ULARGE_INTEGER lastProcessTreeTime = { 0 };
+    int numProcessors = 0;
+
+    CpuUsageTracker() {
+        SYSTEM_INFO sysInfo;
+        GetSystemInfo(&sysInfo);
+        numProcessors = sysInfo.dwNumberOfProcessors;
+    }
+
+    double GetUsage(DWORD currentRootPid, const std::unordered_set<DWORD>& treePids) {
+        if (currentRootPid == 0 || treePids.empty()) return 0.0;
+
+        FILETIME sysTimeNow;
+        GetSystemTimeAsFileTime(&sysTimeNow);
+        ULARGE_INTEGER sysCurrent;
+        sysCurrent.LowPart = sysTimeNow.dwLowDateTime;
+        sysCurrent.HighPart = sysTimeNow.dwHighDateTime;
+
+        // Sum the kernel and user time for EVERY process in the tree
+        ULARGE_INTEGER totalProcCurrent = { 0 };
+        for (DWORD pid : treePids) {
+            HANDLE hProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+            if (hProcess) {
+                FILETIME creationTime, exitTime, kernelTime, userTime;
+                if (GetProcessTimes(hProcess, &creationTime, &exitTime, &kernelTime, &userTime)) {
+                    ULARGE_INTEGER kTime, uTime;
+                    kTime.LowPart = kernelTime.dwLowDateTime;
+                    kTime.HighPart = kernelTime.dwHighDateTime;
+                    uTime.LowPart = userTime.dwLowDateTime;
+                    uTime.HighPart = userTime.dwHighDateTime;
+                    totalProcCurrent.QuadPart += (kTime.QuadPart + uTime.QuadPart);
+                }
+                CloseHandle(hProcess);
+            }
+        }
+
+        double cpuUsage = 0.0;
+
+        if (lastRootPid != currentRootPid) {
+            lastRootPid = currentRootPid;
+            lastSystemTime = sysCurrent;
+            lastProcessTreeTime = totalProcCurrent;
+            return 0.0; 
+        }
+
+        ULONGLONG sysDelta = sysCurrent.QuadPart - lastSystemTime.QuadPart;
+        
+        // Prevent negative spikes if a heavy child process closed between ticks
+        if (totalProcCurrent.QuadPart >= lastProcessTreeTime.QuadPart) {
+            ULONGLONG procDelta = totalProcCurrent.QuadPart - lastProcessTreeTime.QuadPart;
+            if (sysDelta > 0) {
+                cpuUsage = ((double)procDelta / (double)sysDelta) * 100.0 / numProcessors;
+            }
+        }
+
+        lastSystemTime = sysCurrent;
+        lastProcessTreeTime = totalProcCurrent;
+
+        return cpuUsage;
+    }
+};
+
 
 int APIENTRY wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance, _In_ LPWSTR lpCmdLine, _In_ int nCmdShow) {
     
@@ -147,7 +257,10 @@ SetLayeredWindowAttributes(hwnd, RGB(0, 0, 0), 255, LWA_ALPHA);
     static ULONGLONG lastUpdateTime = 0;
     static DWORD cachedPid = 0;
     static size_t cachedRamMB = 0;
-    static char cachedProcessName[MAX_PATH] = "Unknown"; // Stores the display name
+    static char cachedProcessName[MAX_PATH] = "Unknown";
+    static double cachedCpuUsage = 0.0; // NEW: Store CPU percentage
+    
+    CpuUsageTracker cpuTracker; // NEW: Initialize the tracker
 
     while (!done) {
         while (PeekMessage(&msg, nullptr, 0U, 0U, PM_REMOVE)) {
@@ -165,44 +278,31 @@ SetLayeredWindowAttributes(hwnd, RGB(0, 0, 0), 255, LWA_ALPHA);
             HWND hForeground = GetForegroundWindow();
             GetWindowThreadProcessId(hForeground, &cachedPid);
             
-            // 1. Fetch Process Name (with fallback to PID)
+            // 1. Fetch Process Name
             HANDLE hProcessInfo = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, cachedPid);
             bool nameFound = false;
             if (hProcessInfo) {
                 char exePath[MAX_PATH];
                 DWORD size = MAX_PATH;
                 if (QueryFullProcessImageNameA(hProcessInfo, 0, exePath, &size)) {
-                    // Find the last backslash in the full path to isolate the file name
                     char* fileName = strrchr(exePath, '\\');
-                    if (fileName) {
-                        strcpy_s(cachedProcessName, sizeof(cachedProcessName), fileName + 1);
-                    } else {
-                        strcpy_s(cachedProcessName, sizeof(cachedProcessName), exePath);
-                    }
+                    if (fileName) strcpy_s(cachedProcessName, sizeof(cachedProcessName), fileName + 1);
+                    else strcpy_s(cachedProcessName, sizeof(cachedProcessName), exePath);
                     nameFound = true;
                 }
                 CloseHandle(hProcessInfo);
             }
-            
-            // Fallback if Windows denies access to the process name
-            if (!nameFound) {
-                sprintf_s(cachedProcessName, sizeof(cachedProcessName), "PID: %lu", cachedPid);
-            }
+            if (!nameFound) sprintf_s(cachedProcessName, sizeof(cachedProcessName), "PID: %lu", cachedPid);
 
-            // 2. Calculate Tree RAM
+            //get the shared process tree
+            std::unordered_set<DWORD> treePids = GetProcessTreePids(cachedPid);
+
+            // 2. Fetch Tree RAM
             cachedRamMB = GetProcessTreeRAM(cachedPid);
             
-            // 3. Calculate IO/HDD Stats
-            HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, cachedPid);
-            if (hProcess) {
-                IO_COUNTERS ioCounters;
-                if (GetProcessIoCounters(hProcess, &ioCounters)) {
-                    ULONGLONG totalBytesRead = ioCounters.ReadTransferCount;
-                    ULONGLONG totalBytesWritten = ioCounters.WriteTransferCount;
-                }
-                CloseHandle(hProcess);
-            }
-
+            // 3. Fetch CPU Usage (NEW)
+            cachedCpuUsage = cpuTracker.GetUsage(cachedPid, treePids);
+            
             lastUpdateTime = currentTime;
         }
 
@@ -220,10 +320,12 @@ SetLayeredWindowAttributes(hwnd, RGB(0, 0, 0), 255, LWA_ALPHA);
         ImGui::SetNextWindowBgAlpha(0.65f);
         ImGui::Begin("Dev Stats", nullptr, ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoSavedSettings);
 
-        // Display the dynamically formatted string
         ImGui::Text("Active: %s", cachedProcessName);
         ImGui::Separator();
-        ImGui::Text("Tree RAM Usage: %zu MB", cachedRamMB);
+        
+        // Print the formatted float to 1 decimal place
+        ImGui::Text("CPU: %.1f%%", cachedCpuUsage); 
+        ImGui::Text("RAM: %zu MB", cachedRamMB);
 
         ImGui::End();
 
