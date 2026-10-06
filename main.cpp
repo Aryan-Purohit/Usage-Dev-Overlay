@@ -28,6 +28,11 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         return true;
 
     switch (msg) {
+        case WM_HOTKEY:
+            if(wParam == 1){
+                PostQuitMessage(0);
+            }
+            return 0;
         case WM_DESTROY:
             PostQuitMessage(0);
             return 0;
@@ -349,7 +354,7 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance
         nullptr, nullptr, wc.hInstance, nullptr
     );
 
-SetLayeredWindowAttributes(hwnd, RGB(0, 0, 0), 255, LWA_ALPHA);
+    SetLayeredWindowAttributes(hwnd, RGB(0, 0, 0), 255, LWA_ALPHA);
     MARGINS margins = { -1 };
     DwmExtendFrameIntoClientArea(hwnd, &margins);
 
@@ -395,7 +400,10 @@ SetLayeredWindowAttributes(hwnd, RGB(0, 0, 0), 255, LWA_ALPHA);
 
     const float clear_color_with_alpha[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
 
-// 6. Main Application Loop
+    // Register Ctrl + Shift + Q to close the overlay (ID = 1)
+    RegisterHotKey(hwnd, 1, MOD_CONTROL | MOD_SHIFT | MOD_NOREPEAT, 'Q');
+
+    // 6. Main Application Loop
     MSG msg;
     bool done = false;
 
@@ -420,9 +428,9 @@ SetLayeredWindowAttributes(hwnd, RGB(0, 0, 0), 255, LWA_ALPHA);
         }
         if (done) break;
 
-        // ==========================================
+        // ====================================================
         // THROTTLED TELEMETRY GATHERING (Runs once per second)
-        // ==========================================
+        // ====================================================
         ULONGLONG currentTime = GetTickCount64();
         if (currentTime - lastUpdateTime >= 1000) { 
             HWND hForeground = GetForegroundWindow();
@@ -473,7 +481,7 @@ SetLayeredWindowAttributes(hwnd, RGB(0, 0, 0), 255, LWA_ALPHA);
         ImGui::NewFrame();
 
         ImGui::SetNextWindowPos(ImVec2(20, 20), ImGuiCond_FirstUseEver);
-        ImGui::SetNextWindowBgAlpha(0.65f);
+        ImGui::SetNextWindowBgAlpha(1.0f);
         
         ImGui::Begin("Dev Stats", nullptr, ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoSavedSettings);
 
@@ -505,4 +513,10 @@ SetLayeredWindowAttributes(hwnd, RGB(0, 0, 0), 255, LWA_ALPHA);
         ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
         g_pSwapChain->Present(1, 0);
     }
+
+    UnregisterHotKey(hwnd, 1); // NEW: Release the hotkey
+    
+    ImGui_ImplDX11_Shutdown();
+    ImGui_ImplWin32_Shutdown();
+    ImGui::DestroyContext();
 }
