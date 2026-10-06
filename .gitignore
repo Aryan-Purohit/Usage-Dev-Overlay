@@ -1,0 +1,15 @@
+# Compiled executables
+*.exe
+
+# MSVC Build artifacts
+*.obj
+*.ilk
+*.pdb
+*.lib
+*.exp
+
+# Dear ImGui auto-generated state
+imgui.ini
+
+# VS Code directory (Optional: Remove this if you want to share your tasks.json)
+.vscode/
