@@ -31,7 +31,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     return DefWindowProc(hWnd, msg, wParam, lParam);
 }
 
-//HElper function for process root tree calculation
+//HElper function for process root tree RAM calculation
 size_t GetProcessTreeRAM(DWORD rootPid)
 {
     if(rootPid == 0) return 0;
@@ -187,6 +187,66 @@ struct CpuUsageTracker {
     }
 };
 
+// ====================================================================
+//             Helper functions for hdd tracker
+// ====================================================================
+struct DiskIoTracker {
+    DWORD lastRootPid = 0;
+    ULONGLONG lastTime = 0;
+    ULONGLONG lastReadBytes = 0;
+    ULONGLONG lastWriteBytes = 0;
+    double readSpeedMBps = 0.0;
+    double writeSpeedMBps = 0.0;
+
+    void Update(DWORD currentRootPid, const std::unordered_set<DWORD>& treePids, ULONGLONG currentTime) {
+        if (currentRootPid == 0 || treePids.empty()) {
+            readSpeedMBps = 0.0;
+            writeSpeedMBps = 0.0;
+            return;
+        }
+
+        // Sum read and write bytes across the entire process tree
+        ULONGLONG totalRead = 0;
+        ULONGLONG totalWrite = 0;
+        for (DWORD pid : treePids) {
+            HANDLE hProc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+            if (hProc) {
+                IO_COUNTERS ioCounters;
+                if (GetProcessIoCounters(hProc, &ioCounters)) {
+                    totalRead += ioCounters.ReadTransferCount;
+                    totalWrite += ioCounters.WriteTransferCount;
+                }
+                CloseHandle(hProc);
+            }
+        }
+
+        // If the user switched apps, reset baseline
+        if (lastRootPid != currentRootPid || lastTime == 0) {
+            lastRootPid = currentRootPid;
+            lastTime = currentTime;
+            lastReadBytes = totalRead;
+            lastWriteBytes = totalWrite;
+            readSpeedMBps = 0.0;
+            writeSpeedMBps = 0.0;
+            return;
+        }
+
+        double elapsedSeconds = (double)(currentTime - lastTime) / 1000.0;
+        if (elapsedSeconds > 0.0) {
+            ULONGLONG readDelta = (totalRead >= lastReadBytes) ? (totalRead - lastReadBytes) : 0;
+            ULONGLONG writeDelta = (totalWrite >= lastWriteBytes) ? (totalWrite - lastWriteBytes) : 0;
+
+            readSpeedMBps = ((double)readDelta / elapsedSeconds) / (1024.0 * 1024.0);
+            writeSpeedMBps = ((double)writeDelta / elapsedSeconds) / (1024.0 * 1024.0);
+        }
+
+        lastTime = currentTime;
+        lastReadBytes = totalRead;
+        lastWriteBytes = totalWrite;
+    }
+};
+
+
 
 int APIENTRY wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance, _In_ LPWSTR lpCmdLine, _In_ int nCmdShow) {
     
@@ -258,9 +318,10 @@ SetLayeredWindowAttributes(hwnd, RGB(0, 0, 0), 255, LWA_ALPHA);
     static DWORD cachedPid = 0;
     static size_t cachedRamMB = 0;
     static char cachedProcessName[MAX_PATH] = "Unknown";
-    static double cachedCpuUsage = 0.0; // NEW: Store CPU percentage
+    static double cachedCpuUsage = 0.0; // Store CPU percentage
     
-    CpuUsageTracker cpuTracker; // NEW: Initialize the tracker
+    CpuUsageTracker cpuTracker; // Initialize the tracker
+    DiskIoTracker diskTracker;
 
     while (!done) {
         while (PeekMessage(&msg, nullptr, 0U, 0U, PM_REMOVE)) {
@@ -300,8 +361,11 @@ SetLayeredWindowAttributes(hwnd, RGB(0, 0, 0), 255, LWA_ALPHA);
             // 2. Fetch Tree RAM
             cachedRamMB = GetProcessTreeRAM(cachedPid);
             
-            // 3. Fetch CPU Usage (NEW)
+            // 3. Fetch CPU Usage
             cachedCpuUsage = cpuTracker.GetUsage(cachedPid, treePids);
+
+            //4. Fetch HDD Usage
+            diskTracker.Update(cachedPid, treePids, currentTime);
             
             lastUpdateTime = currentTime;
         }
@@ -318,14 +382,24 @@ SetLayeredWindowAttributes(hwnd, RGB(0, 0, 0), 255, LWA_ALPHA);
 
         ImGui::SetNextWindowPos(ImVec2(20, 20), ImGuiCond_FirstUseEver);
         ImGui::SetNextWindowBgAlpha(0.65f);
+        
         ImGui::Begin("Dev Stats", nullptr, ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoSavedSettings);
 
         ImGui::Text("Active: %s", cachedProcessName);
         ImGui::Separator();
         
         // Print the formatted float to 1 decimal place
-        ImGui::Text("CPU: %.1f%%", cachedCpuUsage); 
+        //ImGui::Text("CPU: %.1f%%", cachedCpuUsage);
+        ImVec4 cpuColor = (cachedCpuUsage > 80.0f) ? ImVec4(1.0f, 0.0f, 0.0f, 1.0f) : // Red
+                          (cachedCpuUsage > 30.0f) ? ImVec4(1.0f, 1.0f, 0.0f, 1.0f) : // Yellow
+                                                     ImVec4(0.0f, 1.0f, 0.0f, 1.0f);  // Green
+        ImGui::TextColored(cpuColor, "CPU: %.1f%%", cachedCpuUsage);
+        
+
         ImGui::Text("RAM: %zu MB", cachedRamMB);
+        ImVec4 diskColor = (diskTracker.readSpeedMBps > 10.0f) ? ImVec4(0.0f, 0.8f, 1.0f, 1.0f) : ImVec4(1.0f, 1.0f, 1.0f, 1.0f);
+        ImGui::TextColored(diskColor, "Disk Read: %.2f MB/s", diskTracker.readSpeedMBps);
+        ImGui::Text("Disk Write: %.2f MB/s", diskTracker.writeSpeedMBps);
 
         ImGui::End();
 
