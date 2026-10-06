@@ -4,6 +4,8 @@
 #include <Psapi.h>
 #include <TlHelp32.h>
 #include <unordered_set>
+#include <Pdh.h>
+#include <vector>
 
 // Dear ImGui headers (Assuming you downloaded them into your project)
 #include "./imgui-resources/imgui.h"
@@ -15,6 +17,7 @@
 #pragma comment(lib, "d3d11.lib")
 #pragma comment(lib, "dwmapi.lib")
 #pragma comment(lib, "psapi.lib")
+#pragma comment(lib, "pdh.lib")
 
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
 
@@ -31,7 +34,9 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     return DefWindowProc(hWnd, msg, wParam, lParam);
 }
 
-//HElper function for process root tree RAM calculation
+// ====================================================================
+//             Helper functions for RAM tracker
+// ====================================================================
 size_t GetProcessTreeRAM(DWORD rootPid)
 {
     if(rootPid == 0) return 0;
@@ -121,7 +126,9 @@ size_t GetProcessTreeRAM(const std::unordered_set<DWORD>& treePids) {
     return totalRamBytes / (1024 * 1024);
 }
 
-// 3. Updated CPU Tracker: Sums execution time across the entire tree
+// ====================================================================
+//             Helper functions for CPU tracker
+// ====================================================================
 struct CpuUsageTracker {
     DWORD lastRootPid = 0;
     ULARGE_INTEGER lastSystemTime = { 0 };
@@ -246,8 +253,68 @@ struct DiskIoTracker {
     }
 };
 
+// ====================================================================
+//             Helper functions for GPU tracker
+// ====================================================================
+#include <vector> // Add this near your other includes
+
+struct GpuUsageTracker {
+    PDH_HQUERY hQuery = nullptr;
+    PDH_HCOUNTER hCounter = nullptr;
+    DWORD lastPid = 0;
+
+    ~GpuUsageTracker() {
+        if (hQuery) PdhCloseQuery(hQuery);
+    }
+
+    double GetUsage(DWORD currentPid) {
+        if (currentPid == 0) return 0.0;
+
+        // If the user clicked a new window, we must completely rebuild the PDH query for the new PID
+        if (currentPid != lastPid || !hQuery) {
+            if (hQuery) PdhCloseQuery(hQuery);
+            PdhOpenQuery(nullptr, 0, &hQuery);
+            
+            // Query all GPU engines attached to this specific PID
+            char counterPath[256];
+            sprintf_s(counterPath, "\\GPU Engine(pid_%lu_*)\\Utilization Percentage", currentPid);
+            
+            PdhAddEnglishCounterA(hQuery, counterPath, 0, &hCounter);
+            PdhCollectQueryData(hQuery); // First call establishes the baseline
+            
+            lastPid = currentPid;
+            return 0.0; // Needs 1 tick to calculate a delta, just like CPU
+        }
+
+        // Collect the data delta since the last tick
+        PdhCollectQueryData(hQuery);
+
+        // Determine how much memory we need to hold the results of the wildcard query
+        DWORD bufferSize = 0;
+        DWORD itemCount = 0;
+        PdhGetFormattedCounterArrayA(hCounter, PDH_FMT_DOUBLE, &bufferSize, &itemCount, nullptr);
+
+        if (bufferSize == 0 || itemCount == 0) return 0.0;
+
+        // Allocate memory and fetch the actual array of engine percentages
+        std::vector<char> buffer(bufferSize);
+        auto* items = reinterpret_cast<PDH_FMT_COUNTERVALUE_ITEM_A*>(buffer.data());
+        
+        double totalGpu = 0.0;
+        if (PdhGetFormattedCounterArrayA(hCounter, PDH_FMT_DOUBLE, &bufferSize, &itemCount, items) == ERROR_SUCCESS) {
+            for (DWORD i = 0; i < itemCount; i++) {
+                totalGpu += items[i].FmtValue.doubleValue;
+            }
+        }
+
+        return totalGpu;
+    }
+};
 
 
+// ====================================================================
+//             Main Function
+// ====================================================================
 int APIENTRY wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance, _In_ LPWSTR lpCmdLine, _In_ int nCmdShow) {
     
     // 1. Register the Window Class
@@ -319,9 +386,12 @@ SetLayeredWindowAttributes(hwnd, RGB(0, 0, 0), 255, LWA_ALPHA);
     static size_t cachedRamMB = 0;
     static char cachedProcessName[MAX_PATH] = "Unknown";
     static double cachedCpuUsage = 0.0; // Store CPU percentage
+    static double cachedGpuUsage = 0.0; //Store GPU percentage
     
     CpuUsageTracker cpuTracker; // Initialize the tracker
     DiskIoTracker diskTracker;
+    GpuUsageTracker gpuTracker;
+
 
     while (!done) {
         while (PeekMessage(&msg, nullptr, 0U, 0U, PM_REMOVE)) {
@@ -366,6 +436,9 @@ SetLayeredWindowAttributes(hwnd, RGB(0, 0, 0), 255, LWA_ALPHA);
 
             //4. Fetch HDD Usage
             diskTracker.Update(cachedPid, treePids, currentTime);
+
+            //5. Fetch GPU Usage
+            cachedGpuUsage = gpuTracker.GetUsage(cachedPid);
             
             lastUpdateTime = currentTime;
         }
@@ -388,15 +461,21 @@ SetLayeredWindowAttributes(hwnd, RGB(0, 0, 0), 255, LWA_ALPHA);
         ImGui::Text("Active: %s", cachedProcessName);
         ImGui::Separator();
         
-        // Print the formatted float to 1 decimal place
-        //ImGui::Text("CPU: %.1f%%", cachedCpuUsage);
+        //Print CPU Usage Colored Text
         ImVec4 cpuColor = (cachedCpuUsage > 80.0f) ? ImVec4(1.0f, 0.0f, 0.0f, 1.0f) : // Red
                           (cachedCpuUsage > 30.0f) ? ImVec4(1.0f, 1.0f, 0.0f, 1.0f) : // Yellow
                                                      ImVec4(0.0f, 1.0f, 0.0f, 1.0f);  // Green
         ImGui::TextColored(cpuColor, "CPU: %.1f%%", cachedCpuUsage);
         
+        //Print GPU Usage Colored Text
+        ImVec4 gpuColor = (cachedGpuUsage > 80.0f) ? ImVec4(1.0f, 0.0f, 0.0f, 1.0f) :
+                          (cachedGpuUsage > 30.0f) ? ImVec4(1.0f, 1.0f, 0.0f, 1.0f) : ImVec4(0.0f, 1.0f, 0.0f, 1.0f);
+        ImGui::TextColored(gpuColor, "GPU: %.1f%%", cachedGpuUsage);
 
+        //Print RAM Usage Colored Text
         ImGui::Text("RAM: %zu MB", cachedRamMB);
+        
+        //Print Disk Usage Colored Text
         ImVec4 diskColor = (diskTracker.readSpeedMBps > 10.0f) ? ImVec4(0.0f, 0.8f, 1.0f, 1.0f) : ImVec4(1.0f, 1.0f, 1.0f, 1.0f);
         ImGui::TextColored(diskColor, "Disk Read: %.2f MB/s", diskTracker.readSpeedMBps);
         ImGui::Text("Disk Write: %.2f MB/s", diskTracker.writeSpeedMBps);
